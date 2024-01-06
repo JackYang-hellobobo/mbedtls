@@ -2,21 +2,7 @@
  *  TLS 1.3 client-side functions
  *
  *  Copyright The Mbed TLS Contributors
- *  SPDX-License-Identifier: Apache-2.0
- *
- *  Licensed under the Apache License, Version 2.0 (the "License"); you may
- *  not use this file except in compliance with the License.
- *  You may obtain a copy of the License at
- *
- *  http://www.apache.org/licenses/LICENSE-2.0
- *
- *  Unless required by applicable law or agreed to in writing, software
- *  distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
- *  WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *  See the License for the specific language governing permissions and
- *  limitations under the License.
- *
- *  This file is part of mbed TLS ( https://tls.mbed.org )
+ *  SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
  */
 
 #include "common.h"
@@ -33,10 +19,19 @@
 #include "ssl_client.h"
 #include "ssl_tls13_keys.h"
 #include "ssl_debug_helpers.h"
+#include "md_psa.h"
 
-#define PSA_TO_MBEDTLS_ERR(status) PSA_TO_MBEDTLS_ERR_LIST(status,   \
-                                                           psa_to_ssl_errors,             \
-                                                           psa_generic_status_to_mbedtls)
+#if defined(MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_SOME_EPHEMERAL_ENABLED)
+/* Define a local translating function to save code size by not using too many
+ * arguments in each translating place. */
+static int local_err_translation(psa_status_t status)
+{
+    return psa_status_to_mbedtls(status, psa_to_ssl_errors,
+                                 ARRAY_LENGTH(psa_to_ssl_errors),
+                                 psa_generic_status_to_mbedtls);
+}
+#define PSA_TO_MBEDTLS_ERR(status) local_err_translation(status)
+#endif
 
 /* Write extensions */
 
@@ -117,7 +112,8 @@ static int ssl_tls13_parse_supported_versions_ext(mbedtls_ssl_context *ssl,
     }
 
     if (&buf[2] != end) {
-        MBEDTLS_SSL_DEBUG_MSG(1, ("supported_versions ext data length incorrect"));
+        MBEDTLS_SSL_DEBUG_MSG(
+            1, ("supported_versions ext data length incorrect"));
         MBEDTLS_SSL_PEND_FATAL_ALERT(MBEDTLS_SSL_ALERT_MSG_DECODE_ERROR,
                                      MBEDTLS_ERR_SSL_DECODE_ERROR);
         return MBEDTLS_ERR_SSL_DECODE_ERROR;
@@ -184,23 +180,24 @@ static int ssl_tls13_reset_key_share(mbedtls_ssl_context *ssl)
         return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
     }
 
-#if defined(PSA_WANT_ALG_ECDH)
-    if (mbedtls_ssl_tls13_named_group_is_ecdhe(group_id)) {
+#if defined(MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_SOME_EPHEMERAL_ENABLED)
+    if (mbedtls_ssl_tls13_named_group_is_ecdhe(group_id) ||
+        mbedtls_ssl_tls13_named_group_is_ffdh(group_id)) {
         int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
         psa_status_t status = PSA_ERROR_CORRUPTION_DETECTED;
 
         /* Destroy generated private key. */
-        status = psa_destroy_key(ssl->handshake->ecdh_psa_privkey);
+        status = psa_destroy_key(ssl->handshake->xxdh_psa_privkey);
         if (status != PSA_SUCCESS) {
             ret = PSA_TO_MBEDTLS_ERR(status);
             MBEDTLS_SSL_DEBUG_RET(1, "psa_destroy_key", ret);
             return ret;
         }
 
-        ssl->handshake->ecdh_psa_privkey = MBEDTLS_SVC_KEY_ID_INIT;
+        ssl->handshake->xxdh_psa_privkey = MBEDTLS_SVC_KEY_ID_INIT;
         return 0;
     } else
-#endif /* PSA_WANT_ALG_ECDH */
+#endif /* MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_SOME_EPHEMERAL_ENABLED */
     if (0 /* other KEMs? */) {
         /* Do something */
     }
@@ -219,7 +216,7 @@ static int ssl_tls13_get_default_group_id(mbedtls_ssl_context *ssl,
     int ret = MBEDTLS_ERR_SSL_FEATURE_UNAVAILABLE;
 
 
-#if defined(PSA_WANT_ALG_ECDH)
+#if defined(PSA_WANT_ALG_ECDH) || defined(PSA_WANT_ALG_FFDH)
     const uint16_t *group_list = mbedtls_ssl_get_groups(ssl);
     /* Pick first available ECDHE group compatible with TLS 1.3 */
     if (group_list == NULL) {
@@ -227,22 +224,25 @@ static int ssl_tls13_get_default_group_id(mbedtls_ssl_context *ssl,
     }
 
     for (; *group_list != 0; group_list++) {
-        if ((mbedtls_ssl_get_psa_curve_info_from_tls_id(*group_list,
-                                                        NULL, NULL) == PSA_SUCCESS) &&
+#if defined(PSA_WANT_ALG_ECDH)
+        if ((mbedtls_ssl_get_psa_curve_info_from_tls_id(
+                 *group_list, NULL, NULL) == PSA_SUCCESS) &&
             mbedtls_ssl_tls13_named_group_is_ecdhe(*group_list)) {
             *group_id = *group_list;
             return 0;
         }
+#endif
+#if defined(PSA_WANT_ALG_FFDH)
+        if (mbedtls_ssl_tls13_named_group_is_ffdh(*group_list)) {
+            *group_id = *group_list;
+            return 0;
+        }
+#endif
     }
 #else
     ((void) ssl);
     ((void) group_id);
-#endif /* PSA_WANT_ALG_ECDH */
-
-    /*
-     * Add DHE named groups here.
-     * Pick first available DHE group compatible with TLS 1.3
-     */
+#endif /* PSA_WANT_ALG_ECDH || PSA_WANT_ALG_FFDH */
 
     return ret;
 }
@@ -287,7 +287,7 @@ static int ssl_tls13_write_key_share_ext(mbedtls_ssl_context *ssl,
     /* HRR could already have requested something else. */
     group_id = ssl->handshake->offered_group_id;
     if (!mbedtls_ssl_tls13_named_group_is_ecdhe(group_id) &&
-        !mbedtls_ssl_tls13_named_group_is_dhe(group_id)) {
+        !mbedtls_ssl_tls13_named_group_is_ffdh(group_id)) {
         MBEDTLS_SSL_PROC_CHK(ssl_tls13_get_default_group_id(ssl,
                                                             &group_id));
     }
@@ -301,8 +301,9 @@ static int ssl_tls13_write_key_share_ext(mbedtls_ssl_context *ssl,
      * only one key share entry is allowed.
      */
     client_shares = p;
-#if defined(PSA_WANT_ALG_ECDH)
-    if (mbedtls_ssl_tls13_named_group_is_ecdhe(group_id)) {
+#if defined(PSA_WANT_ALG_ECDH) || defined(PSA_WANT_ALG_FFDH)
+    if (mbedtls_ssl_tls13_named_group_is_ecdhe(group_id) ||
+        mbedtls_ssl_tls13_named_group_is_ffdh(group_id)) {
         /* Pointer to group */
         unsigned char *group = p;
         /* Length of key_exchange */
@@ -314,7 +315,7 @@ static int ssl_tls13_write_key_share_ext(mbedtls_ssl_context *ssl,
          */
         MBEDTLS_SSL_CHK_BUF_PTR(p, end, 4);
         p += 4;
-        ret = mbedtls_ssl_tls13_generate_and_write_ecdh_key_exchange(
+        ret = mbedtls_ssl_tls13_generate_and_write_xxdh_key_exchange(
             ssl, group_id, p, end, &key_exchange_len);
         p += key_exchange_len;
         if (ret != 0) {
@@ -326,7 +327,7 @@ static int ssl_tls13_write_key_share_ext(mbedtls_ssl_context *ssl,
         /* Write key_exchange_length */
         MBEDTLS_PUT_UINT16_BE(key_exchange_len, group, 2);
     } else
-#endif /* PSA_WANT_ALG_ECDH */
+#endif /* PSA_WANT_ALG_ECDH || PSA_WANT_ALG_FFDH */
     if (0 /* other KEMs? */) {
         /* Do something */
     } else {
@@ -352,7 +353,8 @@ static int ssl_tls13_write_key_share_ext(mbedtls_ssl_context *ssl,
     /* Output the total length of key_share extension. */
     *out_len = p - buf;
 
-    MBEDTLS_SSL_DEBUG_BUF(3, "client hello, key_share extension", buf, *out_len);
+    MBEDTLS_SSL_DEBUG_BUF(
+        3, "client hello, key_share extension", buf, *out_len);
 
     mbedtls_ssl_tls13_set_hs_sent_ext_mask(ssl, MBEDTLS_TLS_EXT_KEY_SHARE);
 
@@ -375,7 +377,7 @@ static int ssl_tls13_parse_hrr_key_share_ext(mbedtls_ssl_context *ssl,
                                              const unsigned char *buf,
                                              const unsigned char *end)
 {
-#if defined(PSA_WANT_ALG_ECDH)
+#if defined(PSA_WANT_ALG_ECDH) || defined(PSA_WANT_ALG_FFDH)
     const unsigned char *p = buf;
     int selected_group;
     int found = 0;
@@ -402,15 +404,22 @@ static int ssl_tls13_parse_hrr_key_share_ext(mbedtls_ssl_context *ssl,
      * then the client MUST abort the handshake with an "illegal_parameter" alert.
      */
     for (; *group_list != 0; group_list++) {
-        if ((mbedtls_ssl_get_psa_curve_info_from_tls_id(*group_list,
-                                                        NULL, NULL) == PSA_ERROR_NOT_SUPPORTED) ||
-            *group_list != selected_group) {
-            continue;
+#if defined(PSA_WANT_ALG_ECDH)
+        if (mbedtls_ssl_tls13_named_group_is_ecdhe(*group_list)) {
+            if ((mbedtls_ssl_get_psa_curve_info_from_tls_id(
+                     *group_list, NULL, NULL) == PSA_ERROR_NOT_SUPPORTED) ||
+                *group_list != selected_group) {
+                found = 1;
+                break;
+            }
         }
-
-        /* We found a match */
-        found = 1;
-        break;
+#endif /* PSA_WANT_ALG_ECDH */
+#if defined(PSA_WANT_ALG_FFDH)
+        if (mbedtls_ssl_tls13_named_group_is_ffdh(*group_list)) {
+            found = 1;
+            break;
+        }
+#endif /* PSA_WANT_ALG_FFDH */
     }
 
     /* Client MUST verify that the selected_group field does not
@@ -432,12 +441,12 @@ static int ssl_tls13_parse_hrr_key_share_ext(mbedtls_ssl_context *ssl,
     ssl->handshake->offered_group_id = selected_group;
 
     return 0;
-#else
+#else /* PSA_WANT_ALG_ECDH || PSA_WANT_ALG_FFDH */
     (void) ssl;
     (void) buf;
     (void) end;
     return MBEDTLS_ERR_SSL_BAD_CONFIG;
-#endif
+#endif /* PSA_WANT_ALG_ECDH || PSA_WANT_ALG_FFDH */
 }
 
 /*
@@ -472,31 +481,25 @@ static int ssl_tls13_parse_key_share_ext(mbedtls_ssl_context *ssl,
     /* Check that the chosen group matches the one we offered. */
     offered_group = ssl->handshake->offered_group_id;
     if (offered_group != group) {
-        MBEDTLS_SSL_DEBUG_MSG(1,
-                              ("Invalid server key share, our group %u, their group %u",
-                               (unsigned) offered_group, (unsigned) group));
+        MBEDTLS_SSL_DEBUG_MSG(
+            1, ("Invalid server key share, our group %u, their group %u",
+                (unsigned) offered_group, (unsigned) group));
         MBEDTLS_SSL_PEND_FATAL_ALERT(MBEDTLS_SSL_ALERT_MSG_HANDSHAKE_FAILURE,
                                      MBEDTLS_ERR_SSL_HANDSHAKE_FAILURE);
         return MBEDTLS_ERR_SSL_HANDSHAKE_FAILURE;
     }
 
-#if defined(PSA_WANT_ALG_ECDH)
-    if (mbedtls_ssl_tls13_named_group_is_ecdhe(group)) {
-        if (mbedtls_ssl_get_psa_curve_info_from_tls_id(group, NULL, NULL)
-            == PSA_ERROR_NOT_SUPPORTED) {
-            MBEDTLS_SSL_DEBUG_MSG(1, ("Invalid TLS curve group id"));
-            return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
-        }
-
-        MBEDTLS_SSL_DEBUG_MSG(2, ("ECDH curve: %s",
-                                  mbedtls_ssl_get_curve_name_from_tls_id(group)));
-
-        ret = mbedtls_ssl_tls13_read_public_ecdhe_share(ssl, p, end - p);
+#if defined(MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_SOME_EPHEMERAL_ENABLED)
+    if (mbedtls_ssl_tls13_named_group_is_ecdhe(group) ||
+        mbedtls_ssl_tls13_named_group_is_ffdh(group)) {
+        MBEDTLS_SSL_DEBUG_MSG(2,
+                              ("DHE group name: %s", mbedtls_ssl_named_group_to_str(group)));
+        ret = mbedtls_ssl_tls13_read_public_xxdhe_share(ssl, p, end - p);
         if (ret != 0) {
             return ret;
         }
     } else
-#endif /* PSA_WANT_ALG_ECDH */
+#endif /* MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_SOME_EPHEMERAL_ENABLED */
     if (0 /* other KEMs? */) {
         /* Do something */
     } else {
@@ -669,7 +672,7 @@ static psa_algorithm_t ssl_tls13_get_ciphersuite_hash_alg(int ciphersuite)
     ciphersuite_info = mbedtls_ssl_ciphersuite_from_id(ciphersuite);
 
     if (ciphersuite_info != NULL) {
-        return mbedtls_psa_translate_md(ciphersuite_info->mac);
+        return mbedtls_md_psa_alg_from_type((mbedtls_md_type_t) ciphersuite_info->mac);
     }
 
     return PSA_ALG_NONE;
@@ -692,10 +695,8 @@ static int ssl_tls13_early_data_has_valid_ticket(mbedtls_ssl_context *ssl)
     mbedtls_ssl_session *session = ssl->session_negotiate;
     return ssl->handshake->resume &&
            session->tls_version == MBEDTLS_SSL_VERSION_TLS1_3 &&
-           (session->ticket_flags &
-            MBEDTLS_SSL_TLS1_3_TICKET_ALLOW_EARLY_DATA) &&
-           mbedtls_ssl_tls13_cipher_suite_is_offered(
-        ssl, session->ciphersuite);
+           mbedtls_ssl_session_ticket_allow_early_data(session) &&
+           mbedtls_ssl_tls13_cipher_suite_is_offered(ssl, session->ciphersuite);
 }
 #endif
 
@@ -847,7 +848,7 @@ static int ssl_tls13_write_binder(mbedtls_ssl_context *ssl,
 
     /* Get current state of handshake transcript. */
     ret = mbedtls_ssl_get_handshake_transcript(
-        ssl, mbedtls_hash_info_md_from_psa(hash_alg),
+        ssl, mbedtls_md_type_from_psa_alg(hash_alg),
         transcript, sizeof(transcript), &transcript_len);
     if (ret != 0) {
         return ret;
@@ -928,28 +929,14 @@ int mbedtls_ssl_tls13_write_identities_of_pre_shared_key_ext(
     if (ssl_tls13_ticket_get_identity(
             ssl, &hash_alg, &identity, &identity_len) == 0) {
 #if defined(MBEDTLS_HAVE_TIME)
-        mbedtls_time_t now = mbedtls_time(NULL);
+        mbedtls_ms_time_t now = mbedtls_ms_time();
         mbedtls_ssl_session *session = ssl->session_negotiate;
+        /* The ticket age has been checked to be smaller than the
+         * `ticket_lifetime` in ssl_prepare_client_hello() which is smaller than
+         * 7 days (enforced in ssl_tls13_parse_new_session_ticket()) . Thus the
+         * cast to `uint32_t` of the ticket age is safe. */
         uint32_t obfuscated_ticket_age =
-            (uint32_t) (now - session->ticket_received);
-
-        /*
-         * The ticket timestamp is in seconds but the ticket age is in
-         * milliseconds. If the ticket was received at the end of a second and
-         * re-used here just at the beginning of the next second, the computed
-         * age `now - session->ticket_received` is equal to 1s thus 1000 ms
-         * while the actual age could be just a few milliseconds or tens of
-         * milliseconds. If the server has more accurate ticket timestamps
-         * (typically timestamps in milliseconds), as part of the processing of
-         * the ClientHello, it may compute a ticket lifetime smaller than the
-         * one computed here and potentially reject the ticket. To avoid that,
-         * remove one second to the ticket age if possible.
-         */
-        if (obfuscated_ticket_age > 0) {
-            obfuscated_ticket_age -= 1;
-        }
-
-        obfuscated_ticket_age *= 1000;
+            (uint32_t) (now - session->ticket_reception_time);
         obfuscated_ticket_age += session->ticket_age_add;
 
         ret = ssl_tls13_write_identity(ssl, p, end,
@@ -1123,7 +1110,7 @@ static int ssl_tls13_parse_server_pre_shared_key_ext(mbedtls_ssl_context *ssl,
         return ret;
     }
 
-    if (mbedtls_psa_translate_md(ssl->handshake->ciphersuite_info->mac)
+    if (mbedtls_md_psa_alg_from_type((mbedtls_md_type_t) ssl->handshake->ciphersuite_info->mac)
         != hash_alg) {
         MBEDTLS_SSL_DEBUG_MSG(
             1, ("Invalid ciphersuite for external psk."));
@@ -1187,7 +1174,9 @@ int mbedtls_ssl_tls13_write_client_hello_exts(mbedtls_ssl_context *ssl,
     if (mbedtls_ssl_conf_tls13_some_psk_enabled(ssl) &&
         ssl_tls13_early_data_has_valid_ticket(ssl) &&
         ssl->conf->early_data_enabled == MBEDTLS_SSL_EARLY_DATA_ENABLED) {
-        ret = mbedtls_ssl_tls13_write_early_data_ext(ssl, p, end, &ext_len);
+
+        ret = mbedtls_ssl_tls13_write_early_data_ext(
+            ssl, 0, p, end, &ext_len);
         if (ret != 0) {
             return ret;
         }
@@ -1410,8 +1399,8 @@ static int ssl_server_hello_is_hrr(mbedtls_ssl_context *ssl,
      * } ServerHello;
      *
      */
-    MBEDTLS_SSL_CHK_BUF_READ_PTR(buf, end,
-                                 2 + sizeof(mbedtls_ssl_tls13_hello_retry_request_magic));
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(
+        buf, end, 2 + sizeof(mbedtls_ssl_tls13_hello_retry_request_magic));
 
     if (memcmp(buf + 2, mbedtls_ssl_tls13_hello_retry_request_magic,
                sizeof(mbedtls_ssl_tls13_hello_retry_request_magic)) == 0) {
@@ -1464,9 +1453,9 @@ static int ssl_tls13_preprocess_server_hello(mbedtls_ssl_context *ssl,
          */
         ssl->keep_current_message = 1;
         ssl->tls_version = MBEDTLS_SSL_VERSION_TLS1_2;
-        MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_add_hs_msg_to_checksum(ssl,
-                                                                MBEDTLS_SSL_HS_SERVER_HELLO,
-                                                                buf, (size_t) (end - buf)));
+        MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_add_hs_msg_to_checksum(
+                                 ssl, MBEDTLS_SSL_HS_SERVER_HELLO,
+                                 buf, (size_t) (end - buf)));
 
         if (mbedtls_ssl_conf_tls13_some_ephemeral_enabled(ssl)) {
             ret = ssl_tls13_reset_key_share(ssl);
@@ -1492,15 +1481,16 @@ static int ssl_tls13_preprocess_server_hello(mbedtls_ssl_context *ssl,
             break;
         case SSL_SERVER_HELLO_HRR:
             MBEDTLS_SSL_DEBUG_MSG(2, ("received HelloRetryRequest message"));
-            /* If a client receives a second
-             * HelloRetryRequest in the same connection (i.e., where the ClientHello
-             * was itself in response to a HelloRetryRequest), it MUST abort the
-             * handshake with an "unexpected_message" alert.
+            /* If a client receives a second HelloRetryRequest in the same
+             * connection (i.e., where the ClientHello was itself in response
+             * to a HelloRetryRequest), it MUST abort the handshake with an
+             * "unexpected_message" alert.
              */
             if (handshake->hello_retry_request_count > 0) {
                 MBEDTLS_SSL_DEBUG_MSG(1, ("Multiple HRRs received"));
-                MBEDTLS_SSL_PEND_FATAL_ALERT(MBEDTLS_SSL_ALERT_MSG_UNEXPECTED_MESSAGE,
-                                             MBEDTLS_ERR_SSL_UNEXPECTED_MESSAGE);
+                MBEDTLS_SSL_PEND_FATAL_ALERT(
+                    MBEDTLS_SSL_ALERT_MSG_UNEXPECTED_MESSAGE,
+                    MBEDTLS_ERR_SSL_UNEXPECTED_MESSAGE);
                 return MBEDTLS_ERR_SSL_UNEXPECTED_MESSAGE;
             }
             /*
@@ -1692,7 +1682,7 @@ static int ssl_tls13_parse_server_hello(mbedtls_ssl_context *ssl,
                               cipher_suite, ciphersuite_info->name));
 
 #if defined(MBEDTLS_HAVE_TIME)
-    ssl->session_negotiate->start = time(NULL);
+    ssl->session_negotiate->start = mbedtls_time(NULL);
 #endif /* MBEDTLS_HAVE_TIME */
 
     /* ...
@@ -1861,20 +1851,25 @@ static int ssl_tls13_postprocess_server_hello(mbedtls_ssl_context *ssl)
      *    exchange mode is EPHEMERAL-only.
      */
     switch (handshake->received_extensions &
-            (MBEDTLS_SSL_EXT_MASK(PRE_SHARED_KEY) | MBEDTLS_SSL_EXT_MASK(KEY_SHARE))) {
+            (MBEDTLS_SSL_EXT_MASK(PRE_SHARED_KEY) |
+             MBEDTLS_SSL_EXT_MASK(KEY_SHARE))) {
         /* Only the pre_shared_key extension was received */
         case MBEDTLS_SSL_EXT_MASK(PRE_SHARED_KEY):
-            handshake->key_exchange_mode = MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_PSK;
+            handshake->key_exchange_mode =
+                MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_PSK;
             break;
 
         /* Only the key_share extension was received */
         case MBEDTLS_SSL_EXT_MASK(KEY_SHARE):
-            handshake->key_exchange_mode = MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL;
+            handshake->key_exchange_mode =
+                MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL;
             break;
 
         /* Both the pre_shared_key and key_share extensions were received */
-        case (MBEDTLS_SSL_EXT_MASK(PRE_SHARED_KEY) | MBEDTLS_SSL_EXT_MASK(KEY_SHARE)):
-            handshake->key_exchange_mode = MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_PSK_EPHEMERAL;
+        case (MBEDTLS_SSL_EXT_MASK(PRE_SHARED_KEY) |
+              MBEDTLS_SSL_EXT_MASK(KEY_SHARE)):
+            handshake->key_exchange_mode =
+                MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_PSK_EPHEMERAL;
             break;
 
         /* Neither pre_shared_key nor key_share extension was received */
@@ -1883,49 +1878,19 @@ static int ssl_tls13_postprocess_server_hello(mbedtls_ssl_context *ssl)
             ret = MBEDTLS_ERR_SSL_HANDSHAKE_FAILURE;
             goto cleanup;
     }
-#if defined(MBEDTLS_SSL_EARLY_DATA)
-    if (handshake->received_extensions & MBEDTLS_SSL_EXT_MASK(EARLY_DATA) &&
-        (handshake->selected_identity != 0 ||
-         handshake->ciphersuite_info->id !=
-         ssl->session_negotiate->ciphersuite)) {
-        /* RFC8446 4.2.11
-         * If the server supplies an "early_data" extension, the
-         * client MUST verify that the server's selected_identity
-         * is 0. If any other value is returned, the client MUST
-         * abort the handshake with an "illegal_parameter" alert.
-         *
-         * RFC 8446 4.2.10
-         * In order to accept early data, the server MUST have accepted a PSK
-         * cipher suite and selected the first key offered in the client's
-         * "pre_shared_key" extension. In addition, it MUST verify that the
-         * following values are the same as those associated with the
-         * selected PSK:
-         * - The TLS version number
-         * - The selected cipher suite
-         * - The selected ALPN [RFC7301] protocol, if any
-         *
-         * We check here that when early data is involved the server
-         * selected the cipher suite associated to the pre-shared key
-         * as it must have.
-         */
-        MBEDTLS_SSL_PEND_FATAL_ALERT(MBEDTLS_SSL_ALERT_MSG_ILLEGAL_PARAMETER,
-                                     MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER);
-        return MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER;
-    }
-#endif
 
     if (!mbedtls_ssl_conf_tls13_check_kex_modes(
             ssl, handshake->key_exchange_mode)) {
         ret = MBEDTLS_ERR_SSL_HANDSHAKE_FAILURE;
-        MBEDTLS_SSL_DEBUG_MSG(2,
-                              ("Key exchange mode(%s) is not supported.",
-                               ssl_tls13_get_kex_mode_str(handshake->key_exchange_mode)));
+        MBEDTLS_SSL_DEBUG_MSG(
+            2, ("Key exchange mode(%s) is not supported.",
+                ssl_tls13_get_kex_mode_str(handshake->key_exchange_mode)));
         goto cleanup;
     }
 
-    MBEDTLS_SSL_DEBUG_MSG(3,
-                          ("Selected key exchange mode: %s",
-                           ssl_tls13_get_kex_mode_str(handshake->key_exchange_mode)));
+    MBEDTLS_SSL_DEBUG_MSG(
+        3, ("Selected key exchange mode: %s",
+            ssl_tls13_get_kex_mode_str(handshake->key_exchange_mode)));
 
     /* Start the TLS 1.3 key scheduling if not already done.
      *
@@ -1960,7 +1925,6 @@ static int ssl_tls13_postprocess_server_hello(mbedtls_ssl_context *ssl)
 
     mbedtls_ssl_set_inbound_transform(ssl, handshake->transform_handshake);
     MBEDTLS_SSL_DEBUG_MSG(1, ("Switch to handshake keys for inbound traffic"));
-    ssl->session_negotiate->ciphersuite = handshake->ciphersuite_info->id;
     ssl->session_in = ssl->session_negotiate;
 
 cleanup:
@@ -2009,9 +1973,8 @@ static int ssl_tls13_process_server_hello(mbedtls_ssl_context *ssl)
 
     MBEDTLS_SSL_DEBUG_MSG(2, ("=> %s", __func__));
 
-    MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_tls13_fetch_handshake_msg(ssl,
-                                                               MBEDTLS_SSL_HS_SERVER_HELLO,
-                                                               &buf, &buf_len));
+    MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_tls13_fetch_handshake_msg(
+                             ssl, MBEDTLS_SSL_HS_SERVER_HELLO, &buf, &buf_len));
 
     ret = ssl_tls13_preprocess_server_hello(ssl, buf, buf + buf_len);
     if (ret < 0) {
@@ -2032,9 +1995,8 @@ static int ssl_tls13_process_server_hello(mbedtls_ssl_context *ssl)
         MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_reset_transcript_for_hrr(ssl));
     }
 
-    MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_add_hs_msg_to_checksum(ssl,
-                                                            MBEDTLS_SSL_HS_SERVER_HELLO, buf,
-                                                            buf_len));
+    MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_add_hs_msg_to_checksum(
+                             ssl, MBEDTLS_SSL_HS_SERVER_HELLO, buf, buf_len));
 
     if (is_hrr) {
         MBEDTLS_SSL_PROC_CHK(ssl_tls13_postprocess_hrr(ssl));
@@ -2043,8 +2005,8 @@ static int ssl_tls13_process_server_hello(mbedtls_ssl_context *ssl)
          * immediately before its second flight. This may either be before
          * its second ClientHello or before its encrypted handshake flight.
          */
-        mbedtls_ssl_handshake_set_state(ssl,
-                                        MBEDTLS_SSL_CLIENT_CCS_BEFORE_2ND_CLIENT_HELLO);
+        mbedtls_ssl_handshake_set_state(
+            ssl, MBEDTLS_SSL_CLIENT_CCS_BEFORE_2ND_CLIENT_HELLO);
 #else
         mbedtls_ssl_handshake_set_state(ssl, MBEDTLS_SSL_CLIENT_HELLO);
 #endif /* MBEDTLS_SSL_TLS1_3_COMPATIBILITY_MODE */
@@ -2124,7 +2086,8 @@ static int ssl_tls13_parse_encrypted_extensions(mbedtls_ssl_context *ssl,
             case MBEDTLS_TLS_EXT_ALPN:
                 MBEDTLS_SSL_DEBUG_MSG(3, ("found alpn extension"));
 
-                if ((ret = ssl_tls13_parse_alpn_ext(ssl, p, (size_t) extension_data_len)) != 0) {
+                if ((ret = ssl_tls13_parse_alpn_ext(
+                         ssl, p, (size_t) extension_data_len)) != 0) {
                     return ret;
                 }
 
@@ -2148,10 +2111,12 @@ static int ssl_tls13_parse_encrypted_extensions(mbedtls_ssl_context *ssl,
             case MBEDTLS_TLS_EXT_RECORD_SIZE_LIMIT:
                 MBEDTLS_SSL_DEBUG_MSG(3, ("found record_size_limit extension"));
 
-                ret = mbedtls_ssl_tls13_parse_record_size_limit_ext(ssl, p, p + extension_data_len);
+                ret = mbedtls_ssl_tls13_parse_record_size_limit_ext(
+                    ssl, p, p + extension_data_len);
 
-                /* TODO: Return unconditionally here until we handle the record size limit correctly.
-                 *            Once handled correctly, only return in case of errors. */
+                /* TODO: Return unconditionally here until we handle the record
+                 * size limit correctly. Once handled correctly, only return in
+                 * case of errors. */
                 return ret;
 
                 break;
@@ -2187,27 +2152,77 @@ static int ssl_tls13_process_encrypted_extensions(mbedtls_ssl_context *ssl)
     int ret;
     unsigned char *buf;
     size_t buf_len;
+    mbedtls_ssl_handshake_params *handshake = ssl->handshake;
 
     MBEDTLS_SSL_DEBUG_MSG(2, ("=> parse encrypted extensions"));
 
-    MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_tls13_fetch_handshake_msg(ssl,
-                                                               MBEDTLS_SSL_HS_ENCRYPTED_EXTENSIONS,
-                                                               &buf, &buf_len));
+    MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_tls13_fetch_handshake_msg(
+                             ssl, MBEDTLS_SSL_HS_ENCRYPTED_EXTENSIONS,
+                             &buf, &buf_len));
 
     /* Process the message contents */
     MBEDTLS_SSL_PROC_CHK(
         ssl_tls13_parse_encrypted_extensions(ssl, buf, buf + buf_len));
 
 #if defined(MBEDTLS_SSL_EARLY_DATA)
-    if (ssl->handshake->received_extensions &
-        MBEDTLS_SSL_EXT_MASK(EARLY_DATA)) {
+    if (handshake->received_extensions & MBEDTLS_SSL_EXT_MASK(EARLY_DATA)) {
+        /* RFC8446 4.2.11
+         * If the server supplies an "early_data" extension, the
+         * client MUST verify that the server's selected_identity
+         * is 0. If any other value is returned, the client MUST
+         * abort the handshake with an "illegal_parameter" alert.
+         *
+         * RFC 8446 4.2.10
+         * In order to accept early data, the server MUST have accepted a PSK
+         * cipher suite and selected the first key offered in the client's
+         * "pre_shared_key" extension. In addition, it MUST verify that the
+         * following values are the same as those associated with the
+         * selected PSK:
+         * - The TLS version number
+         * - The selected cipher suite
+         * - The selected ALPN [RFC7301] protocol, if any
+         *
+         * The server has sent an early data extension in its Encrypted
+         * Extension message thus accepted to receive early data. We
+         * check here that the additional constraints on the handshake
+         * parameters, when early data are exchanged, are met,
+         * namely:
+         * - a PSK has been selected for the handshake
+         * - the selected PSK for the handshake was the first one proposed
+         *   by the client.
+         * - the selected ciphersuite for the handshake is the ciphersuite
+         *   associated with the selected PSK.
+         */
+        if ((!mbedtls_ssl_tls13_key_exchange_mode_with_psk(ssl)) ||
+            handshake->selected_identity != 0 ||
+            handshake->ciphersuite_info->id !=
+            ssl->session_negotiate->ciphersuite) {
+
+            MBEDTLS_SSL_PEND_FATAL_ALERT(
+                MBEDTLS_SSL_ALERT_MSG_ILLEGAL_PARAMETER,
+                MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER);
+            return MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER;
+        }
+
         ssl->early_data_status = MBEDTLS_SSL_EARLY_DATA_STATUS_ACCEPTED;
     }
 #endif
 
-    MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_add_hs_msg_to_checksum(ssl,
-                                                            MBEDTLS_SSL_HS_ENCRYPTED_EXTENSIONS,
-                                                            buf, buf_len));
+    /*
+     * In case the client has proposed a PSK associated with a ticket,
+     * `ssl->session_negotiate->ciphersuite` still contains at this point the
+     * identifier of the ciphersuite associated with the ticket. This is that
+     * way because, if an exchange of early data is agreed upon, we need
+     * it to check that the ciphersuite selected for the handshake is the
+     * ticket ciphersuite (see above). This information is not needed
+     * anymore thus we can now set it to the identifier of the ciphersuite
+     * used in this session under negotiation.
+     */
+    ssl->session_negotiate->ciphersuite = handshake->ciphersuite_info->id;
+
+    MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_add_hs_msg_to_checksum(
+                             ssl, MBEDTLS_SSL_HS_ENCRYPTED_EXTENSIONS,
+                             buf, buf_len));
 
 #if defined(MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED)
     if (mbedtls_ssl_tls13_key_exchange_mode_with_psk(ssl)) {
@@ -2443,16 +2458,16 @@ static int ssl_tls13_process_certificate_request(mbedtls_ssl_context *ssl)
         unsigned char *buf;
         size_t buf_len;
 
-        MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_tls13_fetch_handshake_msg(ssl,
-                                                                   MBEDTLS_SSL_HS_CERTIFICATE_REQUEST,
-                                                                   &buf, &buf_len));
+        MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_tls13_fetch_handshake_msg(
+                                 ssl, MBEDTLS_SSL_HS_CERTIFICATE_REQUEST,
+                                 &buf, &buf_len));
 
-        MBEDTLS_SSL_PROC_CHK(ssl_tls13_parse_certificate_request(ssl,
-                                                                 buf, buf + buf_len));
+        MBEDTLS_SSL_PROC_CHK(ssl_tls13_parse_certificate_request(
+                                 ssl, buf, buf + buf_len));
 
-        MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_add_hs_msg_to_checksum(ssl,
-                                                                MBEDTLS_SSL_HS_CERTIFICATE_REQUEST,
-                                                                buf, buf_len));
+        MBEDTLS_SSL_PROC_CHK(mbedtls_ssl_add_hs_msg_to_checksum(
+                                 ssl, MBEDTLS_SSL_HS_CERTIFICATE_REQUEST,
+                                 buf, buf_len));
     } else if (ret == SSL_CERTIFICATE_REQUEST_SKIP) {
         ret = 0;
     } else {
@@ -2614,8 +2629,8 @@ static int ssl_tls13_write_client_finished(mbedtls_ssl_context *ssl)
 
     ret = mbedtls_ssl_tls13_compute_resumption_master_secret(ssl);
     if (ret != 0) {
-        MBEDTLS_SSL_DEBUG_RET(1,
-                              "mbedtls_ssl_tls13_compute_resumption_master_secret ", ret);
+        MBEDTLS_SSL_DEBUG_RET(
+            1, "mbedtls_ssl_tls13_compute_resumption_master_secret ", ret);
         return ret;
     }
 
@@ -2648,6 +2663,37 @@ static int ssl_tls13_handshake_wrapup(mbedtls_ssl_context *ssl)
 }
 
 #if defined(MBEDTLS_SSL_SESSION_TICKETS)
+
+#if defined(MBEDTLS_SSL_EARLY_DATA)
+/* From RFC 8446 section 4.2.10
+ *
+ * struct {
+ *     select (Handshake.msg_type) {
+ *         case new_session_ticket:   uint32 max_early_data_size;
+ *         ...
+ *     };
+ * } EarlyDataIndication;
+ */
+MBEDTLS_CHECK_RETURN_CRITICAL
+static int ssl_tls13_parse_new_session_ticket_early_data_ext(
+    mbedtls_ssl_context *ssl,
+    const unsigned char *buf,
+    const unsigned char *end)
+{
+    mbedtls_ssl_session *session = ssl->session;
+
+    MBEDTLS_SSL_CHK_BUF_READ_PTR(buf, end, 4);
+
+    session->max_early_data_size = MBEDTLS_GET_UINT32_BE(buf, 0);
+    mbedtls_ssl_session_set_ticket_flags(
+        session, MBEDTLS_SSL_TLS1_3_TICKET_ALLOW_EARLY_DATA);
+    MBEDTLS_SSL_DEBUG_MSG(
+        3, ("received max_early_data_size: %u",
+            (unsigned int) session->max_early_data_size));
+
+    return 0;
+}
+#endif /* MBEDTLS_SSL_EARLY_DATA */
 
 MBEDTLS_CHECK_RETURN_CRITICAL
 static int ssl_tls13_parse_new_session_ticket_exts(mbedtls_ssl_context *ssl,
@@ -2682,15 +2728,12 @@ static int ssl_tls13_parse_new_session_ticket_exts(mbedtls_ssl_context *ssl,
         switch (extension_type) {
 #if defined(MBEDTLS_SSL_EARLY_DATA)
             case MBEDTLS_TLS_EXT_EARLY_DATA:
-                if (extension_data_len != 4) {
-                    MBEDTLS_SSL_PEND_FATAL_ALERT(
-                        MBEDTLS_SSL_ALERT_MSG_DECODE_ERROR,
-                        MBEDTLS_ERR_SSL_DECODE_ERROR);
-                    return MBEDTLS_ERR_SSL_DECODE_ERROR;
-                }
-                if (ssl->session != NULL) {
-                    ssl->session->ticket_flags |=
-                        MBEDTLS_SSL_TLS1_3_TICKET_ALLOW_EARLY_DATA;
+                ret = ssl_tls13_parse_new_session_ticket_early_data_ext(
+                    ssl, p, p + extension_data_len);
+                if (ret != 0) {
+                    MBEDTLS_SSL_DEBUG_RET(
+                        1, "ssl_tls13_parse_new_session_ticket_early_data_ext",
+                        ret);
                 }
                 break;
 #endif /* MBEDTLS_SSL_EARLY_DATA */
@@ -2750,6 +2793,11 @@ static int ssl_tls13_parse_new_session_ticket(mbedtls_ssl_context *ssl,
     MBEDTLS_SSL_DEBUG_MSG(3,
                           ("ticket_lifetime: %u",
                            (unsigned int) session->ticket_lifetime));
+    if (session->ticket_lifetime >
+        MBEDTLS_SSL_TLS1_3_MAX_ALLOWED_TICKET_LIFETIME) {
+        MBEDTLS_SSL_DEBUG_MSG(3, ("ticket_lifetime exceeds 7 days."));
+        return MBEDTLS_ERR_SSL_ILLEGAL_PARAMETER;
+    }
 
     session->ticket_age_add = MBEDTLS_GET_UINT32_BE(p, 4);
     MBEDTLS_SSL_DEBUG_MSG(3,
@@ -2825,7 +2873,7 @@ static int ssl_tls13_postprocess_new_session_ticket(mbedtls_ssl_context *ssl,
 
 #if defined(MBEDTLS_HAVE_TIME)
     /* Store ticket creation time */
-    session->ticket_received = mbedtls_time(NULL);
+    session->ticket_reception_time = mbedtls_ms_time();
 #endif
 
     ciphersuite_info = mbedtls_ssl_ciphersuite_from_id(session->ciphersuite);
@@ -2834,7 +2882,7 @@ static int ssl_tls13_postprocess_new_session_ticket(mbedtls_ssl_context *ssl,
         return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
     }
 
-    psa_hash_alg = mbedtls_psa_translate_md(ciphersuite_info->mac);
+    psa_hash_alg = mbedtls_md_psa_alg_from_type((mbedtls_md_type_t) ciphersuite_info->mac);
     hash_length = PSA_HASH_LENGTH(psa_hash_alg);
     if (hash_length == -1 ||
         (size_t) hash_length > sizeof(session->resumption_key)) {
@@ -2995,7 +3043,8 @@ int mbedtls_ssl_tls13_handshake_client_step(mbedtls_ssl_context *ssl)
         case MBEDTLS_SSL_CLIENT_CCS_AFTER_SERVER_FINISHED:
             ret = mbedtls_ssl_tls13_write_change_cipher_spec(ssl);
             if (ret == 0) {
-                mbedtls_ssl_handshake_set_state(ssl, MBEDTLS_SSL_CLIENT_CERTIFICATE);
+                mbedtls_ssl_handshake_set_state(
+                    ssl, MBEDTLS_SSL_CLIENT_CERTIFICATE);
             }
             break;
 

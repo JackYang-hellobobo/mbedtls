@@ -3,25 +3,20 @@
  */
 /*
  *  Copyright The Mbed TLS Contributors
- *  SPDX-License-Identifier: Apache-2.0
- *
- *  Licensed under the Apache License, Version 2.0 (the "License"); you may
- *  not use this file except in compliance with the License.
- *  You may obtain a copy of the License at
- *
- *  http://www.apache.org/licenses/LICENSE-2.0
- *
- *  Unless required by applicable law or agreed to in writing, software
- *  distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
- *  WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *  See the License for the specific language governing permissions and
- *  limitations under the License.
+ *  SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
  */
 
 #ifndef PSA_CRYPTO_CORE_H
 #define PSA_CRYPTO_CORE_H
 
-#include "mbedtls/build_info.h"
+/*
+ * Include the build-time configuration information header. Here, we do not
+ * include `"mbedtls/build_info.h"` directly but `"psa/build_info.h"`, which
+ * is basically just an alias to it. This is to ease the maintenance of the
+ * TF-PSA-Crypto repository which has a different build system and
+ * configuration.
+ */
+#include "psa/build_info.h"
 
 #include "psa/crypto.h"
 #include "psa/crypto_se_driver.h"
@@ -38,32 +33,18 @@
  */
 int psa_can_do_hash(psa_algorithm_t hash_alg);
 
-/** Constant-time buffer comparison
- *
- * \param[in]  a    Left-hand buffer for comparison.
- * \param[in]  b    Right-hand buffer for comparison.
- * \param n         Amount of bytes to compare.
- *
- * \return 0 if the buffer contents are equal, non-zero otherwise
- */
-static inline int mbedtls_psa_safer_memcmp(
-    const uint8_t *a, const uint8_t *b, size_t n)
-{
-    size_t i;
-    unsigned char diff = 0;
-
-    for (i = 0; i < n; i++) {
-        diff |= a[i] ^ b[i];
-    }
-
-    return diff;
-}
+typedef enum {
+    PSA_SLOT_EMPTY = 0,
+    PSA_SLOT_OCCUPIED,
+} psa_key_slot_status_t;
 
 /** The data structure representing a key slot, containing key material
  * and metadata for one key.
  */
 typedef struct {
     psa_core_key_attributes_t attr;
+
+    psa_key_slot_status_t status;
 
     /*
      * Number of locks on the key slot held by the library.
@@ -114,7 +95,7 @@ typedef struct {
  */
 static inline int psa_is_key_slot_occupied(const psa_key_slot_t *slot)
 {
-    return slot->attr.type != 0;
+    return slot->status == PSA_SLOT_OCCUPIED;
 }
 
 /** Test whether a key slot is locked.
@@ -246,12 +227,12 @@ psa_status_t psa_copy_key_material_into_slot(psa_key_slot_t *slot,
                                              const uint8_t *data,
                                              size_t data_length);
 
-/** Convert an mbed TLS error code to a PSA error code
+/** Convert an Mbed TLS error code to a PSA error code
  *
  * \note This function is provided solely for the convenience of
  *       Mbed TLS and may be removed at any time without notice.
  *
- * \param ret           An mbed TLS-thrown error code
+ * \param ret           An Mbed TLS-thrown error code
  *
  * \return              The corresponding PSA error code
  */
