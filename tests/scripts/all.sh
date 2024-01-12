@@ -74,6 +74,7 @@
 #      * component_check_XXX: quick tests that aren't worth parallelizing.
 #      * component_build_XXX: build things but don't run them.
 #      * component_test_XXX: build and test.
+#      * component_release_XXX: tests that the CI should skip during PR testing.
 #  * support_XXX: if support_XXX exists and returns false then
 #    component_XXX is not run by default.
 #  * post_XXX: things to do after running the tests.
@@ -750,7 +751,7 @@ pre_check_tools () {
         # Require OpenSSL and GnuTLS if running any tests (as opposed to
         # only doing builds). Not all tests run OpenSSL and GnuTLS, but this
         # is a good enough approximation in practice.
-        *" test_"*)
+        *" test_"* | *" release_test_"*)
             # To avoid setting OpenSSL and GnuTLS for each call to compat.sh
             # and ssl-opt.sh, we just export the variables they require.
             export OPENSSL="$OPENSSL"
@@ -1540,7 +1541,7 @@ component_test_crypto_full_md_light_only () {
     make test
 }
 
-component_test_full_no_cipher () {
+component_test_full_no_cipher_no_psa_crypto () {
     msg "build: full no CIPHER no PSA_CRYPTO_C"
     scripts/config.py full
     scripts/config.py unset MBEDTLS_CIPHER_C
@@ -1565,8 +1566,8 @@ component_test_full_no_cipher () {
 }
 
 # This is a common configurator and test function that is used in:
-# - component_test_full_no_cipher_with_crypto
-# - component_test_full_no_cipher_with_crypto_config
+# - component_test_full_no_cipher_with_psa_crypto
+# - component_test_full_no_cipher_with_psa_crypto_config
 # It accepts 2 input parameters:
 # - $1: boolean value which basically reflects status of MBEDTLS_PSA_CRYPTO_CONFIG
 # - $2: a text string which describes the test component
@@ -1614,11 +1615,11 @@ common_test_full_no_cipher_with_psa_crypto () {
     make test
 }
 
-component_test_full_no_cipher_with_crypto() {
+component_test_full_no_cipher_with_psa_crypto() {
     common_test_full_no_cipher_with_psa_crypto 0 "full no CIPHER no CRYPTO_CONFIG"
 }
 
-component_test_full_no_cipher_with_crypto_config() {
+component_test_full_no_cipher_with_psa_crypto_config() {
     common_test_full_no_cipher_with_psa_crypto 1 "full no CIPHER"
 }
 
@@ -3741,9 +3742,9 @@ component_test_psa_crypto_config_accel_aead () {
 }
 
 # This is a common configuration function used in:
-# - component_test_psa_crypto_config_accel_cipher_aead
-# - component_test_psa_crypto_config_reference_cipher_aead
-common_psa_crypto_config_accel_cipher_aead() {
+# - component_test_psa_crypto_config_accel_cipher_aead_cmac
+# - component_test_psa_crypto_config_reference_cipher_aead_cmac
+common_psa_crypto_config_accel_cipher_aead_cmac() {
     # Start from the full config
     helper_libtestdriver1_adjust_config "full"
 
@@ -3751,12 +3752,12 @@ common_psa_crypto_config_accel_cipher_aead() {
 }
 
 # The 2 following test components, i.e.
-# - component_test_psa_crypto_config_accel_cipher_aead
-# - component_test_psa_crypto_config_reference_cipher_aead
+# - component_test_psa_crypto_config_accel_cipher_aead_cmac
+# - component_test_psa_crypto_config_reference_cipher_aead_cmac
 # are meant to be used together in analyze_outcomes.py script in order to test
 # driver's coverage for ciphers and AEADs.
-component_test_psa_crypto_config_accel_cipher_aead () {
-    msg "build: full config with accelerated cipher and AEAD"
+component_test_psa_crypto_config_accel_cipher_aead_cmac () {
+    msg "build: full config with accelerated cipher inc. AEAD and CMAC"
 
     loc_accel_list="ALG_ECB_NO_PADDING ALG_CBC_NO_PADDING ALG_CBC_PKCS7 ALG_CTR ALG_CFB \
                     ALG_OFB ALG_XTS ALG_STREAM_CIPHER ALG_CCM_STAR_NO_TAG \
@@ -3766,7 +3767,7 @@ component_test_psa_crypto_config_accel_cipher_aead () {
     # Configure
     # ---------
 
-    common_psa_crypto_config_accel_cipher_aead
+    common_psa_crypto_config_accel_cipher_aead_cmac
 
     # Disable the things that are being accelerated
     scripts/config.py unset MBEDTLS_CIPHER_MODE_CBC
@@ -3810,30 +3811,110 @@ component_test_psa_crypto_config_accel_cipher_aead () {
     # Run the tests
     # -------------
 
-    msg "test: full config with accelerated cipher and AEAD"
+    msg "test: full config with accelerated cipher inc. AEAD and CMAC"
     make test
 
-    msg "ssl-opt: full config with accelerated cipher and AEAD"
+    msg "ssl-opt: full config with accelerated cipher inc. AEAD and CMAC"
     tests/ssl-opt.sh
 
-    msg "compat.sh: full config with accelerated cipher and AEAD"
+    msg "compat.sh: full config with accelerated cipher inc. AEAD and CMAC"
     tests/compat.sh -V NO -p mbedTLS
 }
 
-component_test_psa_crypto_config_reference_cipher_aead () {
-    msg "build: full config with non-accelerated cipher and AEAD"
-    common_psa_crypto_config_accel_cipher_aead
+component_test_psa_crypto_config_reference_cipher_aead_cmac () {
+    msg "build: full config with non-accelerated cipher inc. AEAD and CMAC"
+    common_psa_crypto_config_accel_cipher_aead_cmac
 
     make
 
-    msg "test: full config with non-accelerated cipher and AEAD"
+    msg "test: full config with non-accelerated cipher inc. AEAD and CMAC"
     make test
 
-    msg "ssl-opt: full config with non-accelerated cipher and AEAD"
+    msg "ssl-opt: full config with non-accelerated cipher inc. AEAD and CMAC"
     tests/ssl-opt.sh
 
-    msg "compat.sh: full config with non-accelerated cipher and AEAD"
+    msg "compat.sh: full config with non-accelerated cipher inc. AEAD and CMAC"
     tests/compat.sh -V NO -p mbedTLS
+}
+
+common_block_cipher_dispatch() {
+    TEST_WITH_DRIVER="$1"
+
+    # Start from the full config
+    helper_libtestdriver1_adjust_config "full"
+
+    if [ "$TEST_WITH_DRIVER" -eq 1 ]; then
+        # Disable key types that are accelerated (there is no legacy equivalent
+        # symbol for ECB)
+        scripts/config.py unset MBEDTLS_AES_C
+        scripts/config.py unset MBEDTLS_ARIA_C
+        scripts/config.py unset MBEDTLS_CAMELLIA_C
+    fi
+
+    # Disable cipher's modes that, when not accelerated, cause
+    # legacy key types to be re-enabled in "config_adjust_legacy_from_psa.h".
+    # Keep this also in the reference component in order to skip the same tests
+    # that were skipped in the accelerated one.
+    scripts/config.py -f "$CRYPTO_CONFIG_H" unset PSA_WANT_ALG_CTR
+    scripts/config.py -f "$CRYPTO_CONFIG_H" unset PSA_WANT_ALG_CFB
+    scripts/config.py -f "$CRYPTO_CONFIG_H" unset PSA_WANT_ALG_OFB
+    scripts/config.py -f "$CRYPTO_CONFIG_H" unset PSA_WANT_ALG_CBC_NO_PADDING
+    scripts/config.py -f "$CRYPTO_CONFIG_H" unset PSA_WANT_ALG_CBC_PKCS7
+    scripts/config.py -f "$CRYPTO_CONFIG_H" unset PSA_WANT_ALG_CMAC
+    scripts/config.py -f "$CRYPTO_CONFIG_H" unset PSA_WANT_ALG_CCM_STAR_NO_TAG
+
+    # Disable direct dependency on AES_C
+    scripts/config.py unset MBEDTLS_NIST_KW_C
+
+    # Prevent the cipher module from using deprecated PSA path. The reason is
+    # that otherwise there will be tests relying on "aes_info" (defined in
+    # "cipher_wrap.c") whose functions are not available when AES_C is
+    # not defined. ARIA and Camellia are not a problem in this case because
+    # the PSA path is not tested for these key types.
+    scripts/config.py set MBEDTLS_DEPRECATED_REMOVED
+}
+
+component_test_full_block_cipher_psa_dispatch () {
+    msg "build: full + PSA dispatch in block_cipher"
+
+    loc_accel_list="ALG_ECB_NO_PADDING \
+                    KEY_TYPE_AES KEY_TYPE_ARIA KEY_TYPE_CAMELLIA"
+
+    # Configure
+    # ---------
+
+    common_block_cipher_dispatch 1
+
+    # Build
+    # -----
+
+    helper_libtestdriver1_make_drivers "$loc_accel_list"
+
+    helper_libtestdriver1_make_main "$loc_accel_list"
+
+    # Make sure disabled components were not re-enabled by accident (additive
+    # config)
+    not grep mbedtls_aes_ library/aes.o
+    not grep mbedtls_aria_ library/aria.o
+    not grep mbedtls_camellia_ library/camellia.o
+
+    # Run the tests
+    # -------------
+
+    msg "test: full + PSA dispatch in block_cipher"
+    make test
+}
+
+# This is the reference component of component_test_full_block_cipher_psa_dispatch
+component_test_full_block_cipher_legacy_dispatch () {
+    msg "build: full + legacy dispatch in block_cipher"
+
+    common_block_cipher_dispatch 0
+
+    make
+
+    msg "test: full + legacy dispatch in block_cipher"
+    make test
 }
 
 component_test_aead_chachapoly_disabled() {
@@ -5565,6 +5646,7 @@ support_build_armcc () {
 component_test_tls13_only () {
     msg "build: default config with MBEDTLS_SSL_PROTO_TLS1_3, without MBEDTLS_SSL_PROTO_TLS1_2"
     scripts/config.py set MBEDTLS_SSL_EARLY_DATA
+    scripts/config.py set MBEDTLS_SSL_RECORD_SIZE_LIMIT
     make CFLAGS="'-DMBEDTLS_USER_CONFIG_FILE=\"../tests/configs/tls13-only.h\"'"
 
     msg "test: TLS 1.3 only, all key exchange modes enabled"
@@ -5725,21 +5807,6 @@ component_test_tls13_no_compatibility_mode () {
     make test
     msg "ssl-opt.sh (TLS 1.3 no compatibility mode)"
     tests/ssl-opt.sh
-}
-
-component_test_tls13_only_record_size_limit () {
-    msg "build: TLS 1.3 only from default, record size limit extension enabled"
-    scripts/config.py set MBEDTLS_SSL_RECORD_SIZE_LIMIT
-    make CFLAGS="'-DMBEDTLS_USER_CONFIG_FILE=\"../tests/configs/tls13-only.h\"'"
-
-    msg "test_suite_ssl: TLS 1.3 only, record size limit extension enabled"
-    cd tests; ./test_suite_ssl; cd ..
-
-    msg "ssl-opt.sh: (TLS 1.3 only, record size limit extension tests only)"
-    # Both the server and the client will currently abort the handshake when they encounter the
-    # record size limit extension. There is no way to prevent gnutls-cli from sending the extension
-    # which makes all G_NEXT_CLI + P_SRV tests fail. Thus, run only the tests for the this extension.
-    tests/ssl-opt.sh -f "Record Size Limit"
 }
 
 component_build_mingw () {
